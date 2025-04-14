@@ -32,16 +32,17 @@ venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 
 #### 4. Создать .env файл с API ключами
-SENTIMENT_API_KEY=your_apilayer_api_key
-SPAM_API_KEY=your_api_ninjas_key  # опционально
-OPENAI_API_KEY=
+SENTIMENT_API_KEY=ваш_ключ_apilayer
+SPAM_API_KEY=ваш_ключ_api_ninjas
+OPENAI_API_KEY=ваш_ключ_openai  # опционально
+TIMEZONE=Europe/Moscow  # ваша временная зона
 
 #### 5. Запустить сервер
 uvicorn main:app --reload
 
 ### 🔗 Документация API
 Доступна по адресу:
-http://localhost:8000/docs
+http://176.108.248.61:8002/docs
 
 ### 📮 Примеры запросов
 #### Создание жалобы

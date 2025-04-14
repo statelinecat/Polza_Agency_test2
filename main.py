@@ -2,15 +2,17 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status, Request
+from fastapi import FastAPI, HTTPException, status, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import logging
 import requests
 from googletrans import Translator
 from openai import AsyncOpenAI
+import pytz
+import re
 
 # ===== Конфигурация приложения =====
 logging.basicConfig(
@@ -23,7 +25,7 @@ load_dotenv()
 
 
 class Config:
-    DATABASE_FILE = os.getenv("DATABASE_FILE", "/home/stateline/Polza_Agency_test2/complaints.db")
+    DATABASE_FILE = os.getenv("DATABASE_FILE", "complaints.db")
     SENTIMENT_API_URL = "https://api.apilayer.com/sentiment/analysis"
     SENTIMENT_API_KEY = os.getenv("SENTIMENT_API_KEY")
     SPAM_API_URL = "https://api.api-ninjas.com/v1/spamcheck"
@@ -31,6 +33,8 @@ class Config:
     GEOLOCATION_API_URL = "http://ip-api.com/json"
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     API_TIMEOUT = 20
+    TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
+    CATEGORIZATION_METHOD = os.getenv("CATEGORIZATION_METHOD", "local").lower()  # 'openai' или 'local'
 
 
 translator = Translator()
@@ -57,7 +61,7 @@ class ComplaintResponse(BaseModel):
 
 
 class StatusUpdate(BaseModel):
-    id: int = Field(..., example=1)  # Изменено с complaint_id на id
+    id: int = Field(..., example=1)
     status: str = Field(..., example="closed")
 
 
@@ -83,6 +87,23 @@ def init_db():
     except sqlite3.Error as e:
         logger.error(f"Database error: {e}")
         raise RuntimeError(f"Database init failed: {str(e)}")
+
+
+def parse_datetime(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+
+    try:
+        # Пробуем ISO формат
+        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+        return dt.astimezone(Config.TIMEZONE)
+    except ValueError:
+        try:
+            # Пробуем UNIX timestamp
+            dt = datetime.fromtimestamp(int(dt_str))
+            return dt.astimezone(Config.TIMEZONE)
+        except ValueError:
+            return None
 
 
 async def translate_to_english(text: str) -> str:
@@ -131,7 +152,51 @@ def check_spam(text: str) -> bool:
         return False
 
 
-async def detect_category(text: str) -> str:
+def detect_category_local(text: str) -> str:
+    """
+    Локальная функция для определения категории жалобы на основе ключевых слов.
+    Возвращает 'техническая', 'оплата' или 'другое'.
+    """
+    # Нормализуем текст: нижний регистр, удаляем лишние пробелы и знаки препинания
+    normalized_text = re.sub(r'[^\w\s]', '', text.lower().strip())
+
+    # Ключевые слова для технических проблем (с приоритетом)
+    tech_keywords = [
+        'не работает', 'ошибка', 'сбой', 'технический', 'техническая',
+        'баг', 'глюк', 'sms', 'смс', 'код', 'верификац', 'авторизац',
+        'загрузк', 'приложен', 'приложение', 'сайт', 'страниц', 'интернет',
+        'соединен', 'подключен', 'сервер', 'сообщен', 'уведомлен', 'не приходит',
+        'не отправляется', 'не получаю'
+    ]
+
+    # Ключевые слова для проблем с оплатой (с приоритетом)
+    payment_keywords = [
+        'оплат', 'платеж', 'деньг', 'средств', 'перевод', 'карт',
+        'счет', 'банк', 'списан', 'возврат', 'денежн', 'валюта',
+        'комисс', 'чек', 'транзакц', 'refund', 'купил', 'покупк',
+        'не проходит', 'не уходит', 'не зачисляется'
+    ]
+
+    # Проверяем наличие ключевых слов с учетом частичного совпадения
+    is_tech = any(re.search(rf'\b{re.escape(kw)}', normalized_text) for kw in tech_keywords)
+    is_payment = any(re.search(rf'\b{re.escape(kw)}', normalized_text) for kw in payment_keywords)
+
+    # Определяем категорию с учетом приоритетов
+    if is_payment and not is_tech:
+        return "оплата"
+    elif is_tech and not is_payment:
+        return "техническая"
+    elif is_tech and is_payment:
+        # Если есть оба типа ключевых слов, проверяем более конкретные совпадения
+        payment_score = sum(1 for kw in payment_keywords if re.search(rf'\b{re.escape(kw)}', normalized_text))
+        tech_score = sum(1 for kw in tech_keywords if re.search(rf'\b{re.escape(kw)}', normalized_text))
+        return "оплата" if payment_score > tech_score else "техническая"
+    else:
+        return "другое"
+
+
+async def detect_category_openai(text: str) -> str:
+    """Определение категории с помощью OpenAI"""
     if not Config.OPENAI_API_KEY or not openai_client:
         logger.warning("OpenAI API unavailable")
         return "другое"
@@ -151,6 +216,14 @@ async def detect_category(text: str) -> str:
     except Exception as e:
         logger.error(f"OpenAI error: {e}")
         return "другое"
+
+
+async def detect_category(text: str) -> str:
+    """Выбор метода категоризации в зависимости от конфигурации"""
+    if Config.CATEGORIZATION_METHOD == "openai":
+        return await detect_category_openai(text)
+    else:
+        return detect_category_local(text)
 
 
 def get_geolocation(ip: str) -> Dict[str, str]:
@@ -266,12 +339,16 @@ async def create_complaint(complaint: ComplaintCreate, request: Request):
     }
 )
 async def list_complaints(
-        status_filter: Optional[str] = None,
-        since: Optional[str] = None
+        status_filter: Optional[str] = Query(None, description="Фильтр по статусу"),
+        since: Optional[str] = Query(None, description="Дата в ISO формате или UNIX timestamp")
 ):
     try:
+        since_dt = parse_datetime(since)
+
         with sqlite3.connect(Config.DATABASE_FILE) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
+
             query = """
                 SELECT id, text, status, sentiment, category, geolocation, timestamp
                 FROM complaints
@@ -283,10 +360,11 @@ async def list_complaints(
                 query += " AND status = ?"
                 params.append(status_filter)
 
-            if since:
+            if since_dt:
                 query += " AND timestamp >= ?"
-                params.append(since)
+                params.append(since_dt.strftime("%Y-%m-%d %H:%M:%S"))
 
+            logger.info(f"Executing query: {query} with params: {params}")
             cursor.execute(query, params)
             records = cursor.fetchall()
 
@@ -298,13 +376,13 @@ async def list_complaints(
 
             return [
                 ComplaintResponse(
-                    id=row[0],
-                    text=row[1],
-                    status=row[2],
-                    sentiment=row[3],
-                    category=row[4],
-                    geolocation=row[5],
-                    timestamp=row[6]
+                    id=row["id"],
+                    text=row["text"],
+                    status=row["status"],
+                    sentiment=row["sentiment"],
+                    category=row["category"],
+                    geolocation=row["geolocation"],
+                    timestamp=row["timestamp"]
                 ) for row in records
             ]
 
@@ -328,6 +406,7 @@ async def list_complaints(
 async def update_complaint_status(update: StatusUpdate):
     try:
         with sqlite3.connect(Config.DATABASE_FILE) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
             # Проверка существования жалобы
@@ -354,13 +433,13 @@ async def update_complaint_status(update: StatusUpdate):
             record = cursor.fetchone()
 
             return ComplaintResponse(
-                id=record[0],
-                text=record[1],
-                status=record[2],
-                sentiment=record[3],
-                category=record[4],
-                geolocation=record[5],
-                timestamp=record[6]
+                id=record["id"],
+                text=record["text"],
+                status=record["status"],
+                sentiment=record["sentiment"],
+                category=record["category"],
+                geolocation=record["geolocation"],
+                timestamp=record["timestamp"]
             )
 
     except sqlite3.Error as e:
